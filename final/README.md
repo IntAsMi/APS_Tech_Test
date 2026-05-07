@@ -1,5 +1,5 @@
 
-# APS Bank Senior Data Developer Technical Assessment - Matthew Camilleri Mifsud
+# APS Bank Senior Data Developer Technical Assessment - Matthew Camilleri
 
 ## 1. Requirements Gathering
 
@@ -119,13 +119,25 @@ A star schema is employed here for demonstration of how this datawarehouse would
 In the sample data profile number *1001865* may be a joint account to customers *367901* and *407622*, while the same customer *367901* is linked to 10 different profile numbers which may be that a customer has more than one account. Additionally, given the data samples provided, coutning the number of different profiles per customer equates to the number of different accounts per customer, which hints that the term 'profile' here is acitng as a key with the customer-account number keys. Hence, defining clearly per profile number : the customer number, account number and, customer type. 
 
 ## 4. Data Quality and Controls
-| Check | Rule Definition | Layer | Action on Failure |
+
+
+| Data Quality Category | Rule Definition | Layer | Action on Failure |
 | :--- | :--- | :--- | :--- |
-| **Validity** | Each fields satisfies its respective dtype, ie. transaction_number set to integer so must contain only number, fields with amounts should only contain float values, etc.  | Bronze → Silver | Segregate the row into a seperate dataset called 'Rejects' |
-| **Completeness** | `transaction_amount` is not NULL and > 0 | Bronze → Silver | Move row to 'Rejects'|
-| **Validity** | `debit_credit` IN ('C', 'D') | Bronze → Silver | Move row to 'Rejects' |
-| **Integrity** | `transaction_account_number` exists in `Accounts` | Silver → Gold | Allow row, link to `Unknown` surrogate key in `Dim_Account`, raise Warning alert |
-| **Integrity** | `product_code` follows standard taxonomy | Silver | Log warning, proceed with 'Unknown' |
+| **Validity** | **Data Types:** Each field satisfies its expected type (e.g., `transaction_number` is integer, amounts are floats, dates follow correct format). | Bronze → Silver | Reject row to Quarantine, skip processing. |
+| **Completeness & Sensibility** | **Critical Keys:** `transaction_number` and `transaction_account_number` must NOT be NULL. | Bronze → Silver | Reject row to Quarantine. |
+| **Completeness** | **Value Rules:** `transaction_amount` is NOT NULL and > 0. | Bronze → Silver | Reject row to Quarantine. |
+| **Validity** | **Categorical Domain:** `debit_credit` MUST exactly be 'C' or 'D'. | Bronze → Silver | Reject row to Quarantine. |
+| **Sensibility** | **Future Dates:** `transaction_date` cannot be strictly greater than the data-entry datetime (no future transactions). | Bronze → Silver | Reject row to Quarantine, raise Warning Alert. |
+| **Uniqueness** | **Primary Key Duplication:** `transaction_number` MUST be unique across the entire historical dataset. | Bronze → Silver | Reject duplicate row to Quarantine, raise a Critical Alert. |
+| **Integrity** | **Orphan Transactions:** `transaction_account_number` must exist in the `Dim_Account` table. | Silver → Gold | Mapped to `Unidentified` table, trigger High Warning Alert |
+| **Integrity** | **Orphan Accounts:** `customer_group_id` in the Accounts table MUST exist in the `Profile_Groups` mapping table. | Silver → Gold | Mapped to `Unidentified` table, trigger High Warning Alert |
+| **Integrity** | **Customer Type Match:** `customer_pk` MUST exist in either the Physical or Corporate target table. | Silver → Gold | Mapped to `Unidentified` table, trigger High Warning Alert |
+| **Consistency** | **Integrity:** For any given natural key in Dimension tables, `Valid_To` >= `Valid_From`, and ONLY ONE record can have `Is_Active = True`. | Silver → Gold | **Stop ETL Pipeline** and reject latest data batch; indicates critical data logic failure. |
+| **Validity** | **Taxonomy Match:** `product_code` matches the master reference list of active (currently live) bank products. | Silver → Gold | Allow row, label as 'Matured Product', raise Warning Alert. |
+| **Behaviour Anomaly** | **Outlier Detection:** `transaction_amount` is within expected bounds (e.g., < $500,000,000 for standard retail/corporate limits as mentioned above). | Silver → Gold | Allow row, but raise **Compliance/Fraud Alert** for manual review. |
+
+* **Bronze → Silver (Data Cleaning):** This is where one applies a "hard gate" - If the data is mathematically impossible, physically corrupted, or missing core keys, it goes straight to a Quarantine table. It does not enter the clean environment.
+* **Silver → Gold (Business Logic):** This is a "soft gate". If a transaction is perfectly formatted but the Account hasn't been synced from Oracle yet (a data timing issue), it's not drop the transaction. Instead it is mapped to an "Unknown" bucket hence the financial totals reconcile, but an alert to the data team is raised to fix the issue.
 
 ## 5. Transactions Dashboard Design
 **Tooling:** PowerBI or Tableau.
@@ -141,247 +153,3 @@ In the sample data profile number *1001865* may be a joint account to customers 
     *   *Line Chart:* Number of Monthly Transactions by Month (Trend).
 *   **Tables (Bottom):**
     *   *Top 3 Customers by Transaction Value* (Using the Bridge table to map Accounts to Customers).
-
----
-
-## `ERD_and_DataFlow.md`
-
-**Data Flow Architecture**
-
-```mermaid
-graph LR
-    O[(Oracle DB)] -->|Daily Incremental| B[Bronze Layer \n Raw Delta]
-    S[(SQL Server)] -->|CDC / Snapshot| B
-    B -->|Polars / Spark ETL| C[Silver Layer \n Cleansed & SCD2]
-    C -->|Aggregations| D[Gold Layer \n Star Schema]
-    D --> E((PowerBI Dashboard))
-```
-
-**Logical Data Model (Data Mart ERD)**
-
-```mermaid
-erDiagram
-    Fact_Transactions {
-        bigint transaction_sk PK
-        bigint account_sk FK
-        date transaction_date
-        string dr_cr_indicator
-        decimal transaction_amount
-    }
-    Dim_Account {
-        bigint account_sk PK
-        string account_number
-        string customer_group_id
-        string product_code
-        string account_designation
-        date valid_from
-        date valid_to
-        boolean is_active
-    }
-    Dim_Customer {
-        bigint customer_sk PK
-        string customer_profile
-        string customer_type
-        string salutation
-        string hashed_firstname
-        string hashed_lastname
-        string hashed_company_title
-    }
-    Bridge_Account_Customer {
-        bigint account_sk FK
-        bigint customer_sk FK
-        string customer_group_id
-    }
-
-    Fact_Transactions }o--|| Dim_Account : "Executes"
-    Dim_Account ||--o{ Bridge_Account_Customer : "Has"
-    Bridge_Account_Customer }o--|| Dim_Customer : "Owned By"
-```
-*Design Choice / Trade-offs:* As one account (mapped to `customer_group_id`) can belong to multiple profiles (joint accounts), directly linking `Fact_Transactions` to `Dim_Customer` causes a Many-to-Many Cartesian explosion, miscalculating sums. The **Bridge Table** resolves this. Pros: Mathematically accurate aggregates, accurately reflects joint accounts. Cons: Requires an extra `JOIN` impacting query performance on massive datasets.
-
----
-
-## `ETL_Pipeline.py`
-This Python script uses **Polars** to fulfill the request for data manipulation, proving the ETL logic and dynamically answering the three BI questions.
-
-```python
-import polars as pl
-
-def execute_pipeline():
-    print("--- 1. Ingestion (Bronze) ---")
-    # In a real environment, these are read from S3/ADLS Delta Tables
-    df_txns = pl.read_csv("Oracle_Transactions.csv", separator=";")
-    df_accs = pl.read_csv("Oracle_Accounts.csv", separator=";", infer_schema_length=10000)
-    df_prof = pl.read_csv("Oracle_Profile_Groups.csv", separator=";", infer_schema_length=10000)
-    
-    df_cust = pl.read_csv("SQLServer_BANKING_CUSTOMERS.csv", separator=";")
-    df_phys = pl.read_csv("SQLServer_PHYSICAL_CUSTOMERS.csv", separator=";")
-    df_corp = pl.read_csv("SQLServer_CORPORATE_CUSTOMERS.csv", separator=";")
-
-    print("--- 2. Transformation (Silver) ---")
-    # Standardize Dates and numeric formats
-    df_txns = df_txns.with_columns(
-        pl.col("TRANSACTION_DATE").str.strptime(pl.Date, "%d/%m/%Y"),
-        pl.col("TRANSACTION_AMOUNT").cast(pl.Float64)
-    )
-
-    # Resolve Customer Types
-    df_cust_enriched = df_cust.join(df_phys, on="CUSTOMER_PK", how="left").join(
-        df_corp, on="CUSTOMER_PK", how="left"
-    ).with_columns(
-        pl.when(pl.col("COMPANY_TITLE").is_not_null())
-        .then(pl.lit("CORPORATE"))
-        .otherwise(pl.lit("PHYSICAL"))
-        .alias("CUSTOMER_TYPE")
-    )
-
-    print("--- 3. Modeling (Gold - Data Mart) ---")
-    # In a real DW, we generate Surrogate Keys. Using natural keys for this exercise.
-    fact_transactions = df_txns
-    dim_account = df_accs
-    dim_customer = df_cust_enriched
-
-    # Create Bridge Table to handle Many-to-Many Account/Customer Relationship
-    # Account -> Customer Group -> Profiles
-    bridge_account_customer = dim_account.select(["ACCOUNT_NUMBER", "CUSTOMER_GROUP_ID"]).join(
-        df_prof, on="CUSTOMER_GROUP_ID", how="inner"
-    ).select([
-        pl.col("ACCOUNT_NUMBER"),
-        pl.col("PROFILE_NUMBER").alias("CUSTOMER_PROFILE")
-    ])
-
-    print("--- 4. Business Intelligence Queries (Polars Execution) ---")
-
-    # Q1: Monthly Account Balances
-    # Assume 0 start on 01/01/2026.
-    # Group by Account and Month
-    q1_monthly_net = fact_transactions.with_columns(
-        pl.col("TRANSACTION_DATE").dt.truncate("1mo").alias("MONTH"),
-        pl.when(pl.col("DEBIT_CREDIT") == "C")
-        .then(pl.col("TRANSACTION_AMOUNT"))
-        .otherwise(-pl.col("TRANSACTION_AMOUNT"))
-        .alias("NET_AMOUNT")
-    ).group_by(["TRANSACTION_ACCOUNT_NUMBER", "MONTH"]).agg(
-        pl.sum("NET_AMOUNT").alias("MONTHLY_NET")
-    ).sort(["TRANSACTION_ACCOUNT_NUMBER", "MONTH"])
-
-    # Calculate Cumulative Sum using Window functions
-    q1_balances = q1_monthly_net.with_columns(
-        pl.col("MONTHLY_NET").cum_sum().over("TRANSACTION_ACCOUNT_NUMBER").alias("RUNNING_BALANCE")
-    )
-    print("\nQ1: Sample Monthly Account Balances:")
-    print(q1_balances.head(5))
-
-    # Q2: Customer Transactions for Date Range
-    target_profile = 29235  # Sample Profile
-    start_date, end_date = pl.date(2026, 1, 1), pl.date(2026, 12, 31)
-    
-    # Traverse Fact -> Bridge -> Customer
-    q2_cust_txns = fact_transactions.join(
-        bridge_account_customer, left_on="TRANSACTION_ACCOUNT_NUMBER", right_on="ACCOUNT_NUMBER", how="inner"
-    ).filter(
-        (pl.col("CUSTOMER_PROFILE") == target_profile) &
-        (pl.col("TRANSACTION_DATE") >= start_date) &
-        (pl.col("TRANSACTION_DATE") <= end_date)
-    )
-    print(f"\nQ2: Transactions for Profile {target_profile} in 2026: {q2_cust_txns.height} found.")
-
-    # Q3: Month with Highest Deposits Total
-    q3_top_month = fact_transactions.filter(
-        pl.col("DEBIT_CREDIT") == "C"
-    ).with_columns(
-        pl.col("TRANSACTION_DATE").dt.truncate("1mo").alias("MONTH")
-    ).group_by("MONTH").agg(
-        pl.sum("TRANSACTION_AMOUNT").alias("TOTAL_DEPOSITS")
-    ).sort("TOTAL_DEPOSITS", descending=True).head(1)
-    
-    print("\nQ3: Month with Highest Deposits Total:")
-    print(q3_top_month)
-
-if __name__ == "__main__":
-    execute_pipeline()
-```
-
----
-
-## SQL Folder
-
-### `01_monthly_balances.sql`
-*Note: To ensure accounts with 0 transactions in a given month show their carried-over balance, a Calendar generation approach is typically required in SQL. Standard ANSI SQL is used.*
-```sql
-WITH recursive_months AS (
-    -- Assuming PostgreSQL / Snowflake dialect for date series
-    SELECT CAST('2026-01-01' AS DATE) AS report_month
-    UNION ALL
-    SELECT report_month + INTERVAL '1 month'
-    FROM recursive_months
-    WHERE report_month < CURRENT_DATE
-),
-accounts_and_months AS (
-    -- Create a row for every account for every month
-    SELECT a.account_number, rm.report_month
-    FROM Dim_Account a
-    CROSS JOIN recursive_months rm
-),
-monthly_nets AS (
-    -- Calculate net transaction amount per account per month
-    SELECT 
-        transaction_account_number AS account_number,
-        DATE_TRUNC('month', transaction_date) AS report_month,
-        SUM(CASE WHEN debit_credit = 'C' THEN transaction_amount ELSE -transaction_amount END) AS net_amount
-    FROM Fact_Transactions
-    GROUP BY 1, 2
-)
--- Join the generated calendar with nets and compute running total
-SELECT 
-    am.account_number,
-    am.report_month,
-    COALESCE(mn.net_amount, 0) AS monthly_net_change,
-    SUM(COALESCE(mn.net_amount, 0)) OVER (
-        PARTITION BY am.account_number 
-        ORDER BY am.report_month 
-        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-    ) AS running_balance
-FROM accounts_and_months am
-LEFT JOIN monthly_nets mn 
-    ON am.account_number = mn.account_number 
-    AND am.report_month = mn.report_month
-WHERE am.report_month BETWEEN @StartDate AND @EndDate
-ORDER BY am.account_number, am.report_month;
-```
-
-### `02_customer_transactions.sql`
-```sql
-SELECT 
-    t.transaction_number,
-    t.transaction_date,
-    t.debit_credit,
-    t.transaction_amount,
-    a.account_number,
-    c.customer_profile,
-    c.customer_type
-FROM Fact_Transactions t
--- Bridge handles the M:N relationship
-JOIN Bridge_Account_Customer b 
-    ON t.account_sk = b.account_sk
-JOIN Dim_Account a 
-    ON t.account_sk = a.account_sk
-JOIN Dim_Customer c 
-    ON b.customer_sk = c.customer_sk
-WHERE c.customer_profile = @CustomerProfileId
-  AND t.transaction_date BETWEEN @StartDate AND @EndDate
-ORDER BY t.transaction_date DESC;
-```
-
-### `03_top_deposit_month.sql`
-```sql
-SELECT 
-    DATE_TRUNC('month', transaction_date) AS deposit_month,
-    SUM(transaction_amount) AS total_deposits
-FROM Fact_Transactions
-WHERE debit_credit = 'C' 
-  AND transaction_date >= '2026-01-01'
-GROUP BY DATE_TRUNC('month', transaction_date)
-ORDER BY total_deposits DESC
-LIMIT 1;
-```
