@@ -1,0 +1,6 @@
+polars
+pandas
+openpyxl
+pyarrow 
+fastexcel
+ydata-profiling
