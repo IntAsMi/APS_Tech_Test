@@ -1,6 +1,4 @@
-polars
-pandas
+streamlit 
+pandas 
+plotly 
 openpyxl
-pyarrow 
-fastexcel
-ydata-profiling
