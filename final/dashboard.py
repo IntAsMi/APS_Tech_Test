@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 # ==========================================
 # 1. PAGE CONFIGURATION
@@ -24,7 +25,7 @@ def load_and_transform_data():
         
         # Load SQL Server Data
         banking_customers, physical_customers, corporate_customers =  [df.set_axis(df.columns.str.lower().str.replace(' ', '_'), axis=1) for df in pd.read_excel('SQLServer.xlsx', sheet_name=None).values()]
-        
+    
     except FileNotFoundError:
         st.error("Error: Could not find 'Oracle.xlsx' or 'SQLServer.xlsx'. Please ensure they are in the same directory.")
         st.stop()
@@ -80,7 +81,7 @@ st.sidebar.header("Dashboard Filters")
 
 # Date Filter
 min_date = df['transaction_date'].min().date()
-max_date = df['transaction_date'].min().date()
+max_date = df['transaction_date'].max().date()
 
 try:
     start_date, end_date = st.sidebar.date_input("Date Range", [min_date, max_date])
@@ -103,7 +104,7 @@ mask = (
     (df['customer_type'].isin(selected_types)) &
     (df['product_code'].isin(selected_products))
 )
-filtered_df = df.loc[mask]
+filtered_df = df.loc[mask].copy()
 
 # ==========================================
 # 4. KEY PERFORMANCE INDICATORS (KPIs)
@@ -126,25 +127,64 @@ st.divider()
 # ==========================================
 # 5. VISUALIZATIONS
 # ==========================================
-col_chart1, col_chart2 = st.columns(2)
 
-# Chart 1: Transaction Volume Over Time
+# --- COMBINED DUAL-AXIS TIME SERIES CHART ---
+st.markdown("### Monthly Transaction Trends: Value vs. Volume")
+
+# Group data by Month
+filtered_df['month_year'] = filtered_df['transaction_date'].dt.to_period('M').dt.to_timestamp()
+monthly_df = filtered_df.groupby('month_year').agg(
+    total_value=('transaction_amount', 'sum'),
+    transaction_count=('transaction_number', 'count')
+).reset_index()
+
+# Create subplots with secondary y-axis
+fig_time = make_subplots(specs=[[{"secondary_y": True}]])
+
+# Add Value Trace (Left Y-Axis)
+fig_time.add_trace(
+    go.Scatter(
+        x=monthly_df['month_year'], 
+        y=monthly_df['total_value'], 
+        name="Value of Transactions ($)", 
+        mode='lines+markers',
+        line=dict(color='#1f77b4', width=3),
+        marker=dict(size=8)
+    ),
+    secondary_y=False,
+)
+
+# Add Count Trace (Right Y-Axis)
+fig_time.add_trace(
+    go.Bar(
+        x=monthly_df['month_year'], 
+        y=monthly_df['transaction_count'], 
+        name="Number of Transactions", 
+        marker_color='#ff7f0e',
+        opacity=0.4
+    ),
+    secondary_y=True,
+)
+
+# Refine Layout
+fig_time.update_layout(
+    height=450,
+    hovermode="x unified",
+    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+)
+fig_time.update_yaxes(title_text="<b>Value</b> ($)", secondary_y=False, color="#1f77b4")
+fig_time.update_yaxes(title_text="<b>Number</b> of Transactions", secondary_y=True, color="#d62728", showgrid=False)
+
+st.plotly_chart(fig_time, use_container_width=True)
+
+st.divider()
+
+# --- ADDITIONAL VISUALIZATIONS ---
+col_chart1, col_chart2, col_chart3 = st.columns(3)
+
+# Chart: Customer Type Distribution
 with col_chart1:
-    st.markdown("#### Transaction Volume Over Time")
-    time_df = filtered_df.groupby(['transaction_date', 'debit_credit'])['transaction_amount'].sum().reset_index()
-    fig_time = px.line(
-        time_df, 
-        x='transaction_date', 
-        y='transaction_amount', 
-        color='debit_credit',
-        labels={'transaction_date': 'Date', 'transaction_amount': 'Amount', 'debit_credit': 'Type'},
-        color_discrete_map={'C': 'green', 'D': 'red'}
-    )
-    st.plotly_chart(fig_time, width=True)
-
-# Chart 2: Customer Type Distribution
-with col_chart2:
-    st.markdown("#### Transaction Volume by Customer Type")
+    st.markdown("#### Volume by Customer Type")
     cust_df = filtered_df.groupby('customer_type')['transaction_amount'].sum().reset_index()
     fig_cust = px.pie(
         cust_df, 
@@ -153,39 +193,37 @@ with col_chart2:
         hole=0.4,
         color_discrete_sequence=px.colors.sequential.Teal
     )
-    st.plotly_chart(fig_cust, width=True)
+    st.plotly_chart(fig_cust, use_container_width=True)
 
-
-col_chart3, col_chart4 = st.columns(2)
-
-# Chart 3: Top 10 Customers by Transaction Volume
-with col_chart3:
-    st.markdown("#### Top 10 Customers by Volume")
+# Chart: Top Customers by Volume
+with col_chart2:
+    st.markdown("#### Top 10 Customers")
     top_cust = filtered_df.groupby('customer_name')['transaction_amount'].sum().nlargest(10).reset_index()
     fig_top = px.bar(
         top_cust, 
         x='transaction_amount', 
         y='customer_name', 
         orientation='h',
-        labels={'transaction_amount': 'Total Volume', 'customer_name': 'Customer Name'},
+        labels={'transaction_amount': 'Total Volume', 'customer_name': ''},
         color='transaction_amount',
         color_continuous_scale='Blues'
     )
-    fig_top.update_layout(yaxis={'categoryorder':'total ascending'})
-    st.plotly_chart(fig_top, width=True)
+    fig_top.update_layout(yaxis={'categoryorder':'total ascending'}, coloraxis_showscale=False)
+    st.plotly_chart(fig_top, use_container_width=True)
 
-# Chart 4: Volume by Product Code
-with col_chart4:
-    st.markdown("#### Transaction Volume by Product Code")
+# Chart: Volume by Product Code
+with col_chart3:
+    st.markdown("#### Volume by Product Code")
     prod_df = filtered_df.groupby('product_code')['transaction_amount'].sum().reset_index()
     fig_prod = px.bar(
         prod_df, 
         x='product_code', 
         y='transaction_amount',
-        labels={'product_code': 'Product Code', 'transaction_amount': 'Volume'},
+        labels={'product_code': 'Product', 'transaction_amount': 'Total Volume'},
         color='product_code'
     )
-    st.plotly_chart(fig_prod, width=True)
+    fig_prod.update_layout(showlegend=False)
+    st.plotly_chart(fig_prod, use_container_width=True)
 
 st.divider()
 
@@ -198,5 +236,5 @@ st.dataframe(
         'transaction_number', 'transaction_date', 'customer_name', 'customer_type', 
         'account_number', 'product_code', 'debit_credit', 'transaction_amount'
     ]].sort_values(by='transaction_date', ascending=False),
-    width=True
+    use_container_width=True
 )
